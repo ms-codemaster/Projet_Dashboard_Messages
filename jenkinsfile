@@ -1,0 +1,129 @@
+pipeline {
+    agent any
+
+    environment {
+        BACKEND_IMAGE    = "app-backend"
+        FRONTEND_IMAGE   = "app-frontend"
+        K8S_MANIFEST_DIR = "k8s"
+        K8S_NAMESPACE    = "k8s"
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                cleanWs()
+                git branch: 'pre_prod',
+                    credentialsId: 'ssh',
+                    url: 'git@gitlab.com:ms-codemaster/firstapp_05012026.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh "/opt/sonar-scanner/bin/sonar-scanner"
+                }
+            }
+        }
+
+        stage('Build and Scan Docker Images (Parallel)') {
+            parallel {
+
+                stage('Backend Build and Scan') {
+                    steps {
+                        sh '''
+                            docker rmi -f $BACKEND_IMAGE || true
+                            echo "Backend build start"
+                            docker build -t $BACKEND_IMAGE ./backend
+                            echo "Backend scan start"
+                            trivy image --exit-code 1 --severity CRITICAL $BACKEND_IMAGE
+                        '''
+                    }
+                }
+
+                stage('Frontend Build and Scan') {
+                    steps {
+                        sh '''
+                            docker rmi -f $FRONTEND_IMAGE || true
+                            echo "Frontend build start"
+                            docker build -t $FRONTEND_IMAGE ./frontend
+                            echo "Frontend scan start"
+                            trivy image --exit-code 1 --severity CRITICAL $FRONTEND_IMAGE
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Images to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+
+                        docker tag $BACKEND_IMAGE  $DOCKER_USER/$BACKEND_IMAGE:latest
+                        docker tag $FRONTEND_IMAGE $DOCKER_USER/$FRONTEND_IMAGE:latest
+
+                        docker push $DOCKER_USER/$BACKEND_IMAGE:latest
+                        docker push $DOCKER_USER/$FRONTEND_IMAGE:latest
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(
+                    credentialsId: 'k8s',
+                    variable: 'KUBECONFIG_FILE'
+                )]) {
+                    sh '''
+                        export KUBECONFIG=$KUBECONFIG_FILE
+
+                        echo "Deploying to Kubernetes (namespace: k8s)"
+
+                        kubectl apply -f k8s/namespace.yaml
+                        kubectl apply -f k8s/
+
+                        kubectl get pods -n $K8S_NAMESPACE
+                        kubectl get svc  -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            emailext(
+                subject: "${JOB_NAME} - Build #${BUILD_NUMBER} - ${currentBuild.currentResult}",
+                body: """
+                    <h2>Résultat du Pipeline</h2>
+                    <p><b>Projet :</b> ${JOB_NAME}</p>
+                    <p><b>Build Number :</b> ${BUILD_NUMBER}</p>
+                    <p><b>Status :</b> ${currentBuild.currentResult}</p>
+                    <p>
+                      <a href="${BUILD_URL}">Lien vers le build Jenkins</a>
+                    </p>
+                """,
+                mimeType: 'text/html',
+                to: 'mscodemaster@gmail.com'
+            )
+        }
+
+        success {
+            echo "✅ Pipeline terminé avec succès !"
+        }
+
+        failure {
+            echo "❌ Pipeline échoué. Vérifie la console Jenkins."
+        }
+    }
+}
